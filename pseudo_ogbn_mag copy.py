@@ -12,7 +12,7 @@ import tqdm
 import deepspeed
 import random
 from graphsage_model import SAGE
-import dgl.function as fn
+
 from load_graph import load_reddit, inductive_split, load_ogb, load_cora, load_karate, load_mag
 from memory_usage import see_memory_usage
 import tracemalloc
@@ -70,202 +70,34 @@ def load_subtensor(nfeat, labels, seeds, input_nodes, device):
 	print(batch_inputs.device)
 	return batch_inputs, batch_labels
 
-def load_blocks_subtensor(g, feats, labels, blocks, device):
+
+def load_blocks_subtensor(g, labels, blocks, device):
 	"""
 	Extracts features and labels for a subset of nodes
 	"""
 	# print('\nblocks[0].srcdata dgl.NID list')
 	# print(blocks[0].srcdata[dgl.NID].tolist())
-	batch_inputs = feats[0][blocks[0].srcdata[dgl.NID].tolist()].to(device)
-	print('blocks[-1].dstdata')
-	print(blocks[-1].dstdata['_ID'])
-	print('---------------------------------------------------------------------------------------------------')
-	batch_labels = labels[blocks[-1].dstdata['_ID']].to(device)
-	print('\nblocks[-1].dstdata')
-	print(blocks[-1].dstdata[dgl.NID])
-	print(blocks[-1].srcdata[dgl.NID])
-	print()
-   
+	batch_inputs = g.ndata['features'][blocks[0].srcdata[dgl.NID].tolist()].to(device)
+	batch_labels = blocks[-1].dstdata['labels'].to(device)
+	# print('\nblocks[-1].dstdata')
+	# print(blocks[-1].dstdata[dgl.NID])
+	# print()
 	# print('batch_inputs device')
 	# print(batch_inputs.device)
 	return batch_inputs, batch_labels
 
-# def load_blocks_subtensor(g, labels, blocks, device):
-# 	"""
-# 	Extracts features and labels for a subset of nodes
-# 	"""
-# 	# print('\nblocks[0].srcdata dgl.NID list')
-# 	# print(blocks[0].srcdata[dgl.NID].tolist())
-# 	batch_inputs = g.ndata['features'][blocks[0].srcdata[dgl.NID].tolist()].to(device)
-# 	batch_labels = blocks[-1].dstdata['labels'].to(device)
-# 	# print('\nblocks[-1].dstdata')
-# 	# print(blocks[-1].dstdata[dgl.NID])
-# 	# print()
-# 	# print('batch_inputs device')
-# 	# print(batch_inputs.device)
-# 	return batch_inputs, batch_labels
-def neighbor_average_features(g, args):
-    """
-    Compute multi-hop neighbor-averaged node features
-    """
-    print("Compute neighbor-averaged feats")
-    g.ndata["feat_0"] = g.ndata["feat"]
-    for hop in range(1, args.R + 1):
-        g.update_all(fn.copy_u(f"feat_{hop-1}", "msg"),
-                     fn.mean("msg", f"feat_{hop}"))
-    res = []
-    for hop in range(args.R + 1):
-        res.append(g.ndata.pop(f"feat_{hop}"))
-
-    if args.dataset == "ogbn-mag":
-        # For MAG dataset, only return features for target node types (i.e.
-        # paper nodes)
-        target_mask = g.ndata["target_mask"]
-        target_ids = g.ndata[dgl.NID][target_mask]
-        num_target = target_mask.sum().item()
-        new_res = []
-        for x in res:
-            feat = torch.zeros((num_target,) + x.shape[1:],
-                               dtype=x.dtype, device=x.device)
-            feat[target_ids] = x[target_mask]
-            new_res.append(feat)
-        res = new_res
-    return res
-
-def prepare_data(device, args):
-    """
-    Load dataset and compute neighbor-averaged node features used by SIGN model
-    """
-    data = load_mag(args.dataset, device)
-    g, labels, n_classes, train_nid, val_nid, test_nid, evaluator = data
-    in_feats = g.ndata['feat'].shape[1]
-    feats = neighbor_average_features(g, args)
-    labels = labels.to(device)
-    # move to device
-    train_nid = train_nid.to(device)
-    val_nid = val_nid.to(device)
-    test_nid = test_nid.to(device)
-
-    print('in_feats')
-    print(in_feats)
-    print('feats')
-    print(len(feats))
-    print(feats[0].size())
-    sub_graph = dgl.node_subgraph(g,g.ndata["target_mask"])
-
-    train_g = val_g = test_g = sub_graph
-    train_labels = val_labels = test_labels = labels
-    train_g.create_formats_()
-    val_g.create_formats_()
-    test_g.create_formats_()
-
-    tmp = (train_g.in_degrees()==0) & (train_g.out_degrees()==0)
-    isolated_nodes = torch.squeeze(torch.nonzero(tmp, as_tuple=False))
-    train_g.remove_nodes(isolated_nodes)
-
-    return train_g, feats, labels, in_feats, n_classes, train_nid, test_nid
-	
-    # return sub_graph, feats, labels, in_feats_size, n_classes, \
-    #     train_nid, val_nid, test_nid, evaluator
-
-
-
-def train(model, train_g, feats, train_labels, loss_fcn, optimizer, train_loader):
-    model.train()
-    device = train_labels.device
-    for step, (src, output, blocks )in enumerate (train_loader):
-        print('blocks')
-        print(blocks)
-        print(blocks[0])
-        batch_inputs, batch_labels = load_blocks_subtensor(train_g, feats, train_labels, blocks, device)
-        blocks = [block.int().to(device) for block in blocks]
-        batch_pred = model(blocks, batch_inputs)
-        pseudo_mini_loss = loss_fcn(batch_pred, batch_labels)
-        
-        # loss = loss_fcn(model(batch_feats), labels[batch])
-        optimizer.zero_grad()
-        pseudo_mini_loss.backward()
-        optimizer.step()
-        
-        acc = compute_acc(batch_pred, batch_labels)
-
-        gpu_mem_alloc = torch.cuda.max_memory_allocated() / 1024 / 1024 /1024 if torch.cuda.is_available() else 0
-        print(
-					'Epoch {:05d} | Step {:05d} | Loss {:.4f} | Train Acc {:.4f} | Speed (samples/sec) {:.4f} | GPU {:.4f} GB'.format(
-						0, 0, pseudo_mini_loss.item(), acc.item(), np.mean(0), gpu_mem_alloc))
-
-# def pre_process(args, data, device):
-	
-#     g, feats, labels, in_feats, num_classes, \
-#         train_nid, val_nid, test_nid, evaluator = data
-    
-#     # train_loader = torch.utils.data.DataLoader(
-#     #     train_nid, batch_size=args.batch_size, shuffle=True, drop_last=False)
-#     train_g = val_g = test_g = g
-#     train_nfeat = val_nfeat = test_nfeat = g.ndata.pop('feat')
-#     print('train_nfeat')
-#     print(train_nfeat)
-#     print(train_nfeat.size())
-#     print('labels')
-#     print(labels)
-#     print(len(labels))
-#     print("g.ndata")
-#     print(g.ndata)
-#     print(g.ndata['_ID'])
-#     print(len(g.ndata['_ID']))
-#     print(g.ndata['_TYPE'])
-#     print(len(g.ndata['_TYPE']))
-    
-#     print(len(g.ndata['target_mask']))
-    
-#     # train_labels = val_labels = test_labels = g.ndata.pop('label')
-#     train_labels = val_labels = test_labels = labels
-
-#     print(g.ndata)
-#     if not args.data_cpu:
-#         train_nfeat = train_nfeat.to(device)
-#         train_labels = train_labels.to(device)
-# 	# get_memory("-----------------------------------------after label***************************")
-	
-# 	# Create csr/coo/csc formats before launching training processes with multi-gpu.
-# 	# This avoids creating certain formats in each sub-process, which saves momory and CPU.
-#     train_g.create_formats_()
-#     val_g.create_formats_()
-#     test_g.create_formats_()
-
-#     tmp = (train_g.in_degrees()==0) & (train_g.out_degrees()==0)
-#     isolated_nodes = torch.squeeze(torch.nonzero(tmp, as_tuple=False))
-#     train_g.remove_nodes(isolated_nodes)
-#     print('train data')
-#     print(train_g)
-#     print(train_nid) 
-#     print(in_feats)
-#     print(num_classes)
-#     print(feats) 
-#     print(train_labels)
-#     print('test data ')
-#     print(test_g)
-#     print(test_nid)
-#     print(test_labels)
-
-#     return train_g, train_nid, in_feats, num_classes, feats, train_labels, test_g, test_nid, test_labels
-
-
-			
 
 #### Entry point
-def run(args, device, data):
+def run(args, device, data, tic):
 	# Unpack data
-	# train_g, train_nid, in_feats, n_classes, feats, train_labels, test_g, test_nid, test_labels= data
-	train_g, feats, labels, in_feats, n_classes, train_nid, test_nid = data
-	# n_classes, train_g, val_g, test_g, train_nfeat, train_labels, \
-	# val_nfeat, val_labels, test_nfeat, test_labels = data
+	n_classes, train_g, val_g, test_g, train_nfeat, train_labels, \
+	val_nfeat, val_labels, test_nfeat, test_labels = data
 
-	# in_feats = train_nfeat.shape[1]
-	# train_nid = torch.nonzero(train_g.ndata['train_mask'], as_tuple=True)[0]
-	# val_nid = torch.nonzero(val_g.ndata['val_mask'], as_tuple=True)[0]
-	# test_nid = torch.nonzero(~(test_g.ndata['train_mask'] | test_g.ndata['val_mask']), as_tuple=True)[0]
-	# dataloader_device = torch.device('cpu')
+	in_feats = train_nfeat.shape[1]
+	train_nid = torch.nonzero(train_g.ndata['train_mask'], as_tuple=True)[0]
+	val_nid = torch.nonzero(val_g.ndata['val_mask'], as_tuple=True)[0]
+	test_nid = torch.nonzero(~(test_g.ndata['train_mask'] | test_g.ndata['val_mask']), as_tuple=True)[0]
+	dataloader_device = torch.device('cpu')
 
 	sampler = dgl.dataloading.MultiLayerNeighborSampler(
 		[int(fanout) for fanout in args.fan_out.split(',')])
@@ -285,7 +117,7 @@ def run(args, device, data):
 	model = SAGE(in_feats, args.num_hidden, n_classes, args.num_layers, F.relu, args.dropout, args.aggre)
 	model = model.to(device)
 	loss_fcn = nn.CrossEntropyLoss()
-	optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+	optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
 	
 	epoch_train_CPU_time_list = []
@@ -297,6 +129,7 @@ def run(args, device, data):
 	block_generate_time_list = []
 
 
+	
 	for epoch in range(args.num_epochs):
 		print('Epoch ' + str(epoch))
 		# train_start_tic = time.time()
@@ -337,7 +170,7 @@ def run(args, device, data):
 				start.record()
 				
 				# Load the input features as well as output labels
-				batch_inputs, batch_labels = load_blocks_subtensor(train_g, feats, labels, blocks, device)
+				batch_inputs, batch_labels = load_blocks_subtensor(train_g, train_labels, blocks, device)
 				blocks = [block.int().to(device) for block in blocks]
 
 				end.record()
@@ -437,38 +270,9 @@ def run(args, device, data):
 
 	# train_acc = evaluate(model, train_g, train_nfeat, train_labels, train_nid, device)
 	# print('train Acc: {:.4f}'.format(train_acc))
-	test_acc = evaluate(model, train_g, feats, labels, test_nid, device)
-	print('Test Acc: {:.4f}'.format(test_acc))
-def main(args):
-    
-    if args.gpu < 0:
-        device = "cpu"
-    else:
-        device = "cuda:{}".format(args.gpu)
+	# test_acc = evaluate(model, test_g, test_nfeat, test_labels, test_nid, device)
+	# print('Test Acc: {:.4f}'.format(test_acc))
 
-    with torch.no_grad():
-        device = "cpu"
-        data = prepare_data(device, args)
-        # data = pre_process(args, data, device)
-        device = "cuda:0"
-    val_accs = []
-    test_accs = []
-    # for i in range(args.num_epochs):
-        # print(f"Run {i} start training")
-    # train_g, train_nid, in_feats, num_classes, feats, train_labels, test_g, test_nid, test_labels = data
-    print('data')
-    print(data)
-    best_test = run(args, data, device)
-    print('test_acc')
-    print(best_test)
-        # best_val, best_test = run(args, data, device)
-        # val_accs.append(best_val)
-        # test_accs.append(best_test)
-
-    # print(f"Average val accuracy: {np.mean(val_accs):.4f}, "
-    #       f"std: {np.std(val_accs):.4f}")
-    # print(f"Average test accuracy: {np.mean(test_accs):.4f}, "
-    #       f"std: {np.std(test_accs):.4f}")
 
 if __name__=='__main__':
 	# get_memory("-----------------------------------------main_start***************************")
@@ -479,12 +283,12 @@ if __name__=='__main__':
 		help="GPU device ID. Use -1 for CPU training")
 	argparser.add_argument('--seed', type=int, default=1236)
 
-	argparser.add_argument('--dataset', type=str, default='ogbn-mag')
+	# argparser.add_argument('--dataset', type=str, default='ogbn-mag')
 	# argparser.add_argument('--dataset', type=str, default='ogbn-products')
 	# argparser.add_argument('--aggre', type=str, default='lstm')
 	# argparser.add_argument('--dataset', type=str, default='cora')
 	# argparser.add_argument('--dataset', type=str, default='karate')
-	# argparser.add_argument('--dataset', type=str, default='reddit')
+	argparser.add_argument('--dataset', type=str, default='reddit')
 	argparser.add_argument('--aggre', type=str, default='mean')
 	argparser.add_argument('--selection-method', type=str, default='range')
 	argparser.add_argument('--num-epochs', type=int, default=6)
@@ -504,12 +308,6 @@ if __name__=='__main__':
 	# argparser.add_argument('--batch-size', type=int, default=1500)
 	argparser.add_argument('--batch-size', type=int, default=8)
 
-	argparser.add_argument("--eval-batch-size", type=int, default=100000,
-                        help="evaluation batch size")
-	argparser.add_argument("--R", type=int, default=5,
-                        help="number of hops")
-	argparser.add_argument("--weight-decay", type=float, default=0)
-
 
 	argparser.add_argument('--log-every', type=int, default=5)
 	argparser.add_argument('--eval-every', type=int, default=5)
@@ -526,4 +324,73 @@ if __name__=='__main__':
 		     "be undesired if they cannot fit in GPU memory at once. "
 		     "This flag disables that.")
 	args = argparser.parse_args()
-	main(args)
+
+	if args.gpu >= 0:
+		device = torch.device('cuda:%d' % args.gpu)
+	else:
+		device = torch.device('cpu')
+	set_seed(args)
+
+	# get_memory("-----------------------------------------before load_ogb***************************")
+	t2 = ttt(tt, "before load_data")
+	if args.dataset=='karate':
+		g, n_classes = load_karate()
+	elif args.dataset=='cora':
+		g, n_classes = load_cora()
+	elif args.dataset=='reddit':
+		g, n_classes = load_reddit()
+	elif args.dataset=='ogbn-products':
+		g, n_classes = load_ogb(args.dataset)
+		print('#nodes:', g.number_of_nodes())
+		print('#edges:', g.number_of_edges())
+		print('#classes:', n_classes)
+	elif args.dataset=='ogbn-mag':
+		g, labels, n_classes, train_nid, val_nid, test_nid, evaluator = load_mag(args.dataset)
+		
+	else:
+		raise Exception('unknown dataset')
+	# see_memory_usage("-----------------------------------------after data to cpu------------------------")
+	t3 = ttt(t2, "after load_dataset")
+	if args.inductive:
+		train_g, val_g, test_g = inductive_split(g)
+		train_nfeat = train_g.ndata.pop('features')
+		val_nfeat = val_g.ndata.pop('features')
+		test_nfeat = test_g.ndata.pop('features')
+		train_labels = train_g.ndata.pop('labels')
+		val_labels = val_g.ndata.pop('labels')
+		test_labels = test_g.ndata.pop('labels')
+	else:
+		train_g = val_g = test_g = g
+		train_nfeat = val_nfeat = test_nfeat = g.ndata.pop('feat')
+		print('g.ndata')
+		print(g.ndata)
+		train_labels = val_labels = test_labels = g.ndata.pop('label')
+		print('train_labels------------------------------------------------------------------------------')
+		print(train_labels)
+		print(len(train_labels))
+
+	# get_memory("-----------------------------------------after inductive else***************************")
+	t4 = ttt(t3, "after inductive else")
+	print('args.data_cpu')
+	print(args.data_cpu)
+
+	if not args.data_cpu:
+		train_nfeat = train_nfeat.to(device)
+		train_labels = train_labels.to(device)
+	# get_memory("-----------------------------------------after label***************************")
+	t5 = ttt(t4, "after label")
+	# Create csr/coo/csc formats before launching training processes with multi-gpu.
+	# This avoids creating certain formats in each sub-process, which saves momory and CPU.
+	train_g.create_formats_()
+	val_g.create_formats_()
+	test_g.create_formats_()
+	t6 = ttt(t5, "after train_g.create_formats_()")
+	tmp = (train_g.in_degrees()==0) & (train_g.out_degrees()==0)
+	isolated_nodes = torch.squeeze(torch.nonzero(tmp, as_tuple=False))
+	train_g.remove_nodes(isolated_nodes)
+	# Pack data
+	data = n_classes, train_g, val_g, test_g, train_nfeat, train_labels, \
+	       val_nfeat, val_labels, test_nfeat, test_labels
+	# get_memory("-----------------------------------------after pack data***************************")
+	t7 = ttt(t6, "after pack data")
+	run(args, device, data, t6)

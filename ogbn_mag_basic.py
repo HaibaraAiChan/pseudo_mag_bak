@@ -331,9 +331,12 @@ if __name__ == "__main__":
     argparser.add_argument('--fan-out', type=str, default='10')
     # argparser.add_argument('--batch-size', type=int, default=629571)
     # argparser.add_argument('--batch-size', type=int, default=314786)
-    argparser.add_argument('--batch-size', type=int, default=157393)
+    # argparser.add_argument('--batch-size', type=int, default=157393)
+    # argparser.add_argument('--batch-size', type=int, default=78697)
+    # argparser.add_argument('--batch-size', type=int, default=39349)
     # argparser.add_argument('--batch-size', type=int, default=19675)
-    # argparser.add_argument('--batch-size', type=int, default=4919)
+    # argparser.add_argument('--batch-size', type=int, default=9838)
+    argparser.add_argument('--batch-size', type=int, default=4919)
 
 
 
